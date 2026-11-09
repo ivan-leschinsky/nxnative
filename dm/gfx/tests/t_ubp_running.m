@@ -64,6 +64,9 @@ int main(void) { @autoreleasepool {
 
     // Once it completes, memory holds the truth: what the CPU wrote after it is not overwritten by what was remembered
     g_done = running; running += 1000;
+    // The running submission is committed: its fence is the highest committed one, as on the host, where g_done never passes g_fence. Left behind g_done, the update ring's next
+    // block made the old one a release whose fence had passed, freed at once (defer_obj_at, 1d377206) while this submission's pending updates still read it (gw_commit crashed)
+    atomic_store(&g_fence, running);
     memset(mem, 0x22, LEN);
     update(0x48, 0xf2, 4);
     { const uint32_t want[] = {0x22222222, 0x22222222, 0xf2}; words(made_shadow(0x40, 12), want, 3, "a finished update is no longer laid over memory"); }
