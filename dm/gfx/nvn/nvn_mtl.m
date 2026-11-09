@@ -4327,6 +4327,11 @@ static id<MTLTexture> tex_mtl_(const tex_t *ct) {
         if (!pk) { id<MTLTexture> made = nil; NvSparse *ps = sparse_make(t, 0, &made);
             if (ps) { pk = [NvPkg new]; pk->ps = ps; pk->tex = made; pk->sparse = 1; sparse_sync(ps, t, 1); tex_put(t->serial, pk); return pk->tex; } }
         if (pk) {   // Already uploaded: check the covered pages only if there has been a guest write since the last check
+            // On another thread (the present thread) the texture is taken as last uploaded: a re-upload opens an upload batch, which only the submit thread may (up_owner_check
+            // aborted), and marking it seen here would let the submit thread's next check pass over a write. A package with no tracked span re-uploads at every check: with present
+            // snapshots on a tex_dirty_upload profile (Ocarina of Time) the present thread re-uploaded a window texture the CPU had written (t_nvn 6g). present_enqueue resolves
+            // the presented texture on the submit thread first, so what is shown is current
+            if (!on_sub_thread()) return pk->view ? pk->view : pk->tex;
             if (g_nabs) pkg_absorb_take(pk, t);
             if (g_nabsp && pkg_absorb_waits(t->serial)) return pk->view ? pk->view : pk->tex;
             uint64_t now = nvn_dirty_now();
@@ -15954,8 +15959,11 @@ static uint64_t present_enqueue(const tex_t *t, double period, const int crop[4]
     xv_check(t->serial, 0, 0, "present"); if (g_xv_npresent < 128) g_xv_present[g_xv_npresent++] = t->serial;
     // A texture whose content comes from its storage is uploaded when it is first resolved (and again when its pages change), in an upload batch only the submit thread may open.
     // Bastion fills both window textures with WriteTexels at boot (main+0x9374) and presents one before drawing into it: resolved on the present thread, the upload aborted the host.
-    // Resolve it here, where the game queues the present, and commit the batch, so the display command buffer comes after the upload on the queue and the present thread finds it uploaded
-    if (!ev_val && on_sub_thread() && tex_from_storage(t)) { tex_mtl(t); up_flush(); }
+    // Any packaged texture re-uploads on resolution once the CPU wrote its pages (tex_mtl_), whoever resolves it: with present snapshots, snap_take resolves a window texture here first
+    // (a tex_dirty_upload profile packages one the CPU wrote, Ocarina of Time's), and a later present that finds the ring busy hands the texture itself to the present thread, which
+    // re-uploaded it there and aborted (t_nvn 6g under that profile). So every presented texture is resolved here, where the game queues the present, and the batch committed, so the
+    // display command buffer (and a snapshot's copy) comes after the upload on the queue and the present thread finds it uploaded; a texture with nothing to upload only costs a lookup
+    if (!ev_val && on_sub_thread()) { tex_mtl(t); up_flush(); }
     static pthread_once_t once = PTHREAD_ONCE_INIT; pthread_once(&once, present_start);
     link_sync();
     {   // Test switch DM_TEST_LINK_STALL=start seconds,duration seconds: counting from the first present, pause the display link at that point (imitating the display link not calling back while in the foreground) and release it when the duration is up. For verifying the fallback; not set in the product
