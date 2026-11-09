@@ -3,6 +3,7 @@ build folder is <title ID>_build in the NSP folder and the IPA is in the NSP fol
 default place when --work-dir is new). The run stops at the prerequisite check; no game files, keys or Xcode needed."""
 import importlib.util
 from pathlib import Path
+import struct
 import sys
 import tempfile
 import unittest
@@ -100,6 +101,42 @@ class WorkDir(unittest.TestCase):
             other = self.tmp / 'x'; (other / 'profile').mkdir(parents=True)
             nsp.profile_folder(nsp.parse_args([str(self.nsps), '--work-dir', str(other)]), self.nsps, TID)
             self.assertEqual(list((other / 'profile').iterdir()), [])   # a folder that already has a profile is left alone
+
+
+def npdm(tid):   # the smallest NPDM pack_nup.program_id reads: META, then an ACI0 section with the program ID at +0x10
+    b = bytearray(0xa0); b[:4] = b'META'; struct.pack_into('<II', b, 0x70, 0x80, 0x20); b[0x80:0x84] = b'ACI0'; struct.pack_into('<Q', b, 0x90, tid)
+    return bytes(b)
+
+
+class FromWorkDir(unittest.TestCase):
+    """--from-work-dir: the build folder's extract/v<N>/ stands for the game's files; nothing reads NSPs, a NUP or keys"""
+    def setUp(self):
+        td = tempfile.TemporaryDirectory(); self.addCleanup(td.cleanup)
+        self.work = Path(td.name).resolve() / 'games' / f'{TID:016X}_build'
+        for v in ('v0', 'v131072'):
+            d = self.work / 'extract' / v; (d / 'ExeFS').mkdir(parents=True)
+            (d / 'ExeFS/main.npdm').write_bytes(npdm(TID)); (d / 'RomFS.img').write_bytes(b'img')
+        (self.work / 'extract/v65536/ExeFS').mkdir(parents=True); (self.work / 'extract/v65536/RomFS.img.part').write_bytes(b'')   # an unpack cut short
+
+    def test_scan_takes_whole_versions_and_the_title_id(self):
+        app, fam = nsp.scan_work(self.work)
+        self.assertEqual((app, list(nsp.nsp_versions(fam))), (TID, ['v0', 'v131072']))
+        with self.assertRaises(nsp.BuildError): nsp.scan_work(self.work, TID + 0x1000)
+        with self.assertRaises(nsp.BuildError): nsp.scan_work(self.work.parent)   # no extract/: build from the game's files first
+
+    def test_plan_builds_in_the_folder_without_the_game_files(self):
+        said, seen = [], {}
+        def stop(env, *a): seen.update(env); raise Stop()
+        def never(*a, **k): raise AssertionError('the game files were read')
+        with mock.patch.object(nsp, 'find_repo', return_value=REPO), mock.patch.object(nsp, 'scan_nsps', side_effect=never), mock.patch.object(nsp, 'scan_nup', side_effect=never), \
+             mock.patch.object(nsp, 'configure_dotnet'), mock.patch.object(nsp, 'WORK_DIR', ''), mock.patch.object(nsp, 'NSP_DIR', ''), mock.patch.object(nsp, 'check_prereqs', side_effect=stop), \
+             mock.patch.object(nsp, 'say', side_effect=said.append):
+            with self.assertRaises(Stop): nsp.main(nsp.parse_args(['--from-work-dir', str(self.work)]))
+        ipa = next(m.split(': ', 1)[1] for m in said if m.startswith('output IPA: '))
+        self.assertEqual((Path(seen['DM_ROOT']), Path(ipa)), (self.work, self.work.parent / profile_ipa()))
+
+    def test_no_game_folder_with_it(self):
+        with self.assertRaises(nsp.BuildError): nsp.main(nsp.parse_args([str(self.work.parent), '--from-work-dir', str(self.work)]))
 
 
 if __name__ == '__main__':

@@ -51,6 +51,7 @@ PROD_KEYS = ''                          # path of prod.keys (empty = ask at run 
 PACKAGE = ''                            # version packed into the IPA (empty = the newest in the folder; Mario 'v327680' i.e. 1.2.1, or 'v0')
 TITLE_ID = ''                           # the game to pack when the folder holds several, e.g. a cartridge dump with two games: '0100FD8022DAA000' (empty = the folder's one game)
 WORK_DIR = ''                           # the game's build folder (empty = <title ID>_build in the NSP folder); the extracted files, shader cache and temporary files live there, and the IPA (or app) goes beside it unless OUT_IPA names it
+FROM_WORK_DIR = ''                      # a build folder to build from its own extracted files (extract/v<N>/), without the NSPs or NUP (their drive offline); NSP_DIR and WORK_DIR are then not used (empty = off)
 OUT_IPA = ''                            # output IPA (empty = <the profile's ipa> in the NSP folder); with PLATFORM 'mac-app' the output app (empty = <game name>.app in the NSP folder)
 APP_NAME = ''                           # app name on the home screen (empty = the game name in the base NSP)
 BUNDLE_ID = ''                          # the app's bundle ID (empty = saved per-game Xcode ID, else org.nxnative.<base game title ID in lowercase>)
@@ -1312,6 +1313,25 @@ def scan_dump(dump, want=None):   # a dump folder as scan_nsps gives a folder of
     return app, {'base': pack_dump.base_of(dump), 'updates': sorted(vers.items()), 'dlc': [(tid, None, roms) for tid, roms in dlc.items()], 'dump': True}
 
 
+def scan_work(work, want=None):   # a build folder's own extraction (--from-work-dir) as scan_nup gives a NUP: (title ID, {'base', 'updates', 'dlc', 'work': True}), the versions extract/ holds whole
+    ex = work / 'extract'   # an image is written as RomFS.img.part and renamed when complete, so RomFS.img is a whole one
+    vers = sorted((d for d in ex.glob('v*') if d.name[1:].isdigit() and (d / 'RomFS.img').is_file() and (d / 'ExeFS/main.npdm').is_file()), key=lambda d: vnum(d.name)) if ex.is_dir() else []
+    if not vers: raise BuildError(f'--from-work-dir: no extracted version in {ex} (extract/v<N>/ with ExeFS/ and RomFS.img): build once from the game\'s files first')
+    try: ids = {pack_nup.program_id((d / 'ExeFS/main.npdm').read_bytes(), d / 'ExeFS/main.npdm') for d in vers}
+    except pack_nup.Error as e: raise BuildError(str(e)) from e
+    if len(ids) != 1: raise BuildError(f'--from-work-dir: the versions in {ex} are of different games: ' + ', '.join(f'{i:016X}' for i in sorted(ids)))
+    app = ids.pop()
+    if want is not None and want != app: raise BuildError(f'no game {want:016X} (--title-id / TITLE_ID) in {ex}, which holds {app:016X}')
+    return app, {'base': None, 'updates': [(vnum(d.name), None) for d in vers], 'dlc': [], 'work': True}
+
+
+def reuse_extracted(ex, name):   # --from-work-dir: one version as an earlier build extracted it (scan_work checked its code and its image)
+    dst = ex / name
+    PROG.stage(f'extracted {name}')
+    PROG.end(amount((dst / 'RomFS.img').stat().st_size, 'B') + ', from the build folder (--from-work-dir)')
+    return dst
+
+
 def extract_dump(ex, name, src, app):   # one version of a dump folder (src: base/ or updates/<version>/) into the layout extract makes; the code modules and the image are kept while unchanged
     dst = ex / name; part = dst / 'RomFS.img.part'
     def poll():
@@ -1328,7 +1348,8 @@ def extract_aoc(nx, keys, repo, work, app, fam, logs):
     """DLC NSPs in the folder → <id>_build/aoc/<index>.img (the RomFS of each one's data NCA; index = title ID − base − 0x1000, base the application's title ID even for one of its programs,
     app + N, whose DLC are the application's). The host reports these indices as owned and mounts them (DM_AOC_DIR).
     Returns None without DLC. Reused when the DLC NSPs (names, sizes and times) and nx_extract's sources are as at the last extraction (Monster Hunter Rise: 250 DLC, 30 s),
-    and aoc/ holds the files that extraction wrote (names, sizes and times): a NUP or a dump folder packs its DLC into the same aoc/"""
+    and aoc/ holds the files that extraction wrote (names, sizes and times): a NUP or a dump folder packs its DLC into the same aoc/; --from-work-dir takes aoc/ as it is"""
+    if fam.get('work'): return work / 'aoc' if (work / 'aoc').is_dir() else None
     if not fam['dlc']: return None
     if fam.get('nup'):
         PROG.stage('unpack DLC', step='unpacking')
@@ -2818,6 +2839,8 @@ def parse_args(argv):
                     'it must be one the game supports, which the console lists')
     ap.add_argument('--keep-extracted', action=argparse.BooleanOptionalAction, help='keep the extracted game files after the IPA is built, for the next build (default: the KEEP_EXTRACTED setting, on)')
     ap.add_argument('--work-dir', help='the game\'s build folder, used as it is (default: the WORK_DIR setting, else <title ID>_build in the NSP folder); the extracted files, shader cache and temporary files live there, and the IPA or Mac app defaults to the folder holding it')
+    ap.add_argument('--from-work-dir', help='a build folder of an earlier build: build from its extracted files (extract/v<N>/: code, RomFS image, control data) and its DLC, without the game\'s NSPs or NUP, '
+                    'e.g. while the drive holding them is offline; no NSP folder, --work-dir or prod.keys with it; the game needs a profile in dm/games (default: the FROM_WORK_DIR setting)')
     ap.add_argument('--env-file', help='environment switches for a diagnostic build (one KEY=VALUE per line)')
     ap.add_argument('--gpu', help='NVN games: GPU architectures the app gets its pipeline archive for, made on this Mac with metal-tt, comma-separated: g18p (A19 / A19 Pro), or the name a device\'s log gives when the app has no archive for its GPU; '
                     'none = no archive, the device builds the bases on its first start (default: the PSO_GPUS setting; when that is empty, a profile with pso_mtl4 on uses its pso_gpu key or g18p, and other profiles use none). '
@@ -2946,12 +2969,18 @@ def main(args=None):
     if romfs_mode == 'separate' and not keep: raise BuildError('--romfs separate requires --keep-extracted: the image must remain available for the one-time transfer to the phone')
     shader_files = SHADER_FILES if args.shader_files is None else args.shader_files
     if shader_files and (mac or prepare_xcode): raise BuildError('SHADER_FILES / --shader-files shapes the IPA for install tools that cannot copy a large file: it cannot be combined with ' + (f'--platform {platform}' if mac else '--prepare-xcode, which Xcode installs'))
-    nsp_dir = Path(os.path.expanduser(args.nsp_dir or NSP_DIR or ask('NSP folder: ', 'the NSP folder'))).resolve()
-    if not nsp_dir.exists(): raise BuildError(f'not a folder: {nsp_dir}')
-    nup = nup_file(nsp_dir)   # a NUP file given in place of the folder: its folder is the NSP folder (the build folder and the IPA go there)
-    if nsp_dir.is_file(): nsp_dir = nsp_dir.parent
+    from_work = args.from_work_dir or FROM_WORK_DIR   # the build folder's own extraction in place of the game's files (the drive holding them offline)
+    if from_work:
+        if args.nsp_dir or args.work_dir: raise BuildError('--from-work-dir names the build folder and builds from its extracted files: give no NSP folder, NUP or --work-dir with it')
+        args.work_dir = str(Path(os.path.expanduser(from_work)).resolve())   # build_folder takes it as --work-dir: used as it is
+        nsp_dir, nup, dump = Path(args.work_dir).parent, None, 'work'   # the folder holding the build folder stands for the NSP folder: the IPA or app goes there by default, as with --work-dir
+    else:
+        nsp_dir = Path(os.path.expanduser(args.nsp_dir or NSP_DIR or ask('NSP folder: ', 'the NSP folder'))).resolve()
+        if not nsp_dir.exists(): raise BuildError(f'not a folder: {nsp_dir}')
+        nup = nup_file(nsp_dir)   # a NUP file given in place of the folder: its folder is the NSP folder (the build folder and the IPA go there)
+        if nsp_dir.is_file(): nsp_dir = nsp_dir.parent
+        dump = 'nup' if nup else 'folder' if dump_folder(nsp_dir) else None   # their files are not encrypted, so they need no keys
     global NSP_FOLDER; NSP_FOLDER = nsp_dir
-    dump = 'nup' if nup else 'folder' if dump_folder(nsp_dir) else None   # their files are not encrypted, so they need no keys
     keys = None if dump else Path(os.path.expanduser(args.keys or PROD_KEYS or ask('path of prod.keys: ', 'prod.keys (-k)'))).resolve()
     if keys and not keys.is_file(): raise BuildError(f'no such file: {keys}')
     user_icon = Path(os.path.expanduser(args.icon or ICON)).resolve() if args.icon or ICON else None   # checked now, not after the extraction: build_ipa.sh would only log a missing one
@@ -2970,8 +2999,11 @@ def main(args=None):
     want = args.title_id or TITLE_ID
     if want and not re.fullmatch(r'[0-9A-Fa-f]{16}', want): raise BuildError(f'--title-id / TITLE_ID takes a title ID, 16 hex digits: {want}')
     if PROGRAM_INDEX and dump: raise BuildError('--program / PROGRAM_INDEX picks a program from a multi-program application\'s NSPs; '
-                                                     + ('a NUP' if nup else 'a dump folder') + ' is read as one program\'s files')
-    if nup:
+                                                     + {'nup': 'a NUP', 'folder': 'a dump folder', 'work': 'a build folder'}[dump] + ' is read as one program\'s files')
+    if dump == 'work':
+        app, fam = scan_work(Path(args.work_dir), int(want, 16) if want else None)
+        say(f'the build folder\'s extracted files: {app:016X}, {", ".join(nsp_versions(fam))}; the game\'s NSPs or NUP are not read (--from-work-dir)')
+    elif nup:
         app, fam = scan_nup(nup, int(want, 16) if want else None)
         say(f'a NUP: {nup.name}, {app:016X}, {len(fam["updates"])} update(s), {len(fam["dlc"])} DLC')
         if fam['base'] is None: say(pack_nup.NO_BASE)
@@ -2987,6 +3019,7 @@ def main(args=None):
         fam = decompress_nsz(nsp_dir, app, fam, keys, env, work_dir(args))
     force =args.provisional or PROVISIONAL   # a provisional profile even when dm/games has one (testing the guesses)
     g, provisional, shadowed = None if force else gamemod.by_title(app), False, False
+    if dump == 'work' and g is None: raise BuildError(f'--from-work-dir needs a game profile for {app:016X} in dm/games: a provisional profile is made from the game\'s own files')
     alias = None if force or g else same_build(nsp_dir, app, fam, keys, repo, env)   # a known build under another title ID: packed from a profile derived from that build's
     if alias:
         g = alias[0]; say(f'no game profile for {app:016X}, but its main build {alias[2]} is game profile {g.id}\'s {alias[1]} ({g.get("name", "")}) under another title ID')
@@ -3054,7 +3087,7 @@ def main(args=None):
     picks = pick_nsps(fam, have, versions)
 
     ex = work / 'extract'; ex.mkdir(parents=True, exist_ok=True); (work / 'tmp').mkdir(exist_ok=True)
-    gb = (sum(fam['nup'].tree_bytes(pack_nup.romfs_of(u or b, b)) for b, u in picks.values()) if nup else sum(tree_size((u or b) / 'romfs')[1] for b, u in picks.values()) if dump else extract_bytes(picks, False)) / 2**30 + 6   # every merged image is complete, including on APFS; shader cache + slack
+    gb = (sum(fam['nup'].tree_bytes(pack_nup.romfs_of(u or b, b)) for b, u in picks.values()) if nup else 0 if dump == 'work' else sum(tree_size((u or b) / 'romfs')[1] for b, u in picks.values()) if dump else extract_bytes(picks, False)) / 2**30 + 6   # every merged image is complete, including on APFS; shader cache + slack
     if free_gb(work) < gb and not all((ex / v).exists() for v in versions): raise BuildError(f'less than {gb:.0f} GB free on the volume of {work}')
     heapck = provisional and HEAP_CHECK and not args.no_heap_check and not heap_checked(g)   # the heap check, when the game needs one (once per provisional profile: it stamps the profile)
     PROG.plan((not dump) + len(versions) + bool(fam['dlc']) + 4 - (prepare_xcode or (mac and not mac_pack)))   # prepare Xcode (a Mac-only build: the Mac host) replaces app build + IPA pack with one stage (a Mac app: Mac host + Mac app)
@@ -3066,7 +3099,7 @@ def main(args=None):
     dirs = {}
     for ver in versions:   # each merged version streams directly into its own image
         b, u = picks[ver]
-        dirs[ver] = extract_nup(ex, ver, u or b, b, app, fam['nup']) if nup else extract_dump(ex, ver, u or b, app) if dump else extract(nx, keys, ex, ver, b, u, None, logs, g, app)
+        dirs[ver] = reuse_extracted(ex, ver) if dump == 'work' else extract_nup(ex, ver, u or b, b, app, fam['nup']) if nup else extract_dump(ex, ver, u or b, app) if dump else extract(nx, keys, ex, ver, b, u, None, logs, g, app)
         if not nup and not dump: extract_html(nx, keys, dirs[ver], b, u, logs, app)
     check_formats(dirs)
     check_versions_aarch64(dirs, logs, g, nacp.name(dirs[versions[0]] / 'control.nacp') or f'{app:016X}')   # before build_mismatch, derive_profile and build_sources read the modules
